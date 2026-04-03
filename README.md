@@ -3,7 +3,7 @@
 Ročníkový projekt pro ovládání automatických dvířek pomocí ESP32 přes vlastní webové rozhraní (Access Point režim).  
 Jednoduché manuální i automatické řízení s možností nastavení časového rozvrhu.
 
-test.c++ je kód, který se používal pro testování spolupráce jednotlivých součástek dohromady.
+test.ino je kód, který se používal pro testování spolupráce jednotlivých součástek dohromady.
 
 ---
 
