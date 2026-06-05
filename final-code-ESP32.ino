@@ -1,52 +1,66 @@
 #include <WiFi.h>
-#include <ESP32Servo.h>
+#include <Wire.h>
+#include <RTClib.h>
 
-// =========================
-//  WIFI AP (bez routeru)
-// =========================
+// WIFI AP
 const char* AP_SSID = "ESP32-DVIRKA";
-const char* AP_PASS = "123456789";   // min. 8 znaků
+const char* AP_PASS = "123456789";
 
 WiFiServer server(80);
+const int PUL_PIN = 18;
+const int DIR_PIN = 19;
 
-// =========================
-//  SERVO NASTAVENÍ
-// =========================
-Servo servo1;
-Servo servo2;
 
-// Nastav piny, kam vede SIGNÁL serv
-const int SERVO1_PIN = 18;
-const int SERVO2_PIN = 19;
+const bool OPEN_DIR  = HIGH;
+const bool CLOSE_DIR = LOW;
 
-// Pokud máš jen 1 servo, nech USE_SERVO2 = false
-const bool USE_SERVO2 = true;
+int STEP_DELAY_US_UP   = 900;
+int STEP_DELAY_US_DOWN = 1150;
 
-// Úhly pro otevřeno/zavřeno (upravit podle mechaniky)
-int ANGLE_OPEN  = 20;
-int ANGLE_CLOSE = 120;
+const int DIR_CHANGE_DELAY_MS = 50;
 
-// Stav dvířek
-enum DoorState { UNKNOWN, OPEN, CLOSED, OPENING, CLOSING, STOPPED };
+const unsigned long MOVE_TIMEOUT_MS = 25000;
+
+
+RTC_DS3231 rtc;
+const int OPEN_LIMIT_PIN  = 5;
+const int CLOSE_LIMIT_PIN = 4;
+
+enum DoorState {
+  UNKNOWN,
+  OPEN,
+  CLOSED,
+  OPENING,
+  CLOSING,
+  STOPPED,
+  HOMING,
+  ERROR_STATE
+};
+
 DoorState doorState = UNKNOWN;
 
 bool autoMode = false;
+bool homed = false;
 
-// =========================
-//  "ČAS" bez internetu/RTC
-//  (telefon ho nastaví přes web)
-// =========================
-// Udržíme si "sekundy dne" (0..86399) a posun vůči millis()
-bool timeSet = false;
-uint32_t baseMillis = 0;
-uint32_t baseSecondsOfDay = 0;
+enum MotionCommand {
+  CMD_NONE,
+  CMD_OPEN,
+  CMD_CLOSE,
+  CMD_HOME
+};
 
-// =========================
-//  ROZVRHY (jednoduše)
-// =========================
+volatile MotionCommand currentCommand = CMD_NONE;
+bool motorDirection = OPEN_DIR;
+
+unsigned long lastStepMicros = 0;
+unsigned long directionChangedAt = 0;
+bool directionJustChanged = false;
+unsigned long motionStartedAt = 0;
+
+
 struct Schedule {
-  uint16_t openMin;   // minuty dne 0..1439
-  uint16_t closeMin;  // minuty dne 0..1439
+  uint16_t openMin;
+  uint16_t closeMin;
   uint32_t id;
   bool used;
 };
@@ -54,13 +68,6 @@ struct Schedule {
 const int MAX_SCHEDULES = 6;
 Schedule schedules[MAX_SCHEDULES];
 
-// aby se stejné akce nespouštěly pořád dokola
-int lastActionMinuteOpen[MAX_SCHEDULES];
-int lastActionMinuteClose[MAX_SCHEDULES];
-
-// =========================
-//  HTML (UI)
-// =========================
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html lang="cs">
@@ -70,7 +77,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <title>Dvířka – ovládání</title>
   <style>
     :root{
-      --bg:#0b1020; --card:#121a33; --card2:#0f1730; --text:#e8ecff; --muted:#aab3de;
+      --bg:#0b1020; --card:#121a33; --text:#e8ecff; --muted:#aab3de;
       --ok:#35d07f; --bad:#ff4d5d; --warn:#ffcc66; --line:rgba(255,255,255,.08);
       --shadow:0 12px 30px rgba(0,0,0,.35); --r:18px;
     }
@@ -88,37 +95,34 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
     .wrap{max-width:980px;margin:0 auto;padding:18px 14px 28px}
     .top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
-    .title{display:flex;flex-direction:column;gap:4px}
-    .title h1{margin:0;font-size:20px;letter-spacing:.2px}
-    .title p{margin:0;color:var(--muted);font-size:13px}
+    .title h1{margin:0;font-size:20px}
+    .title p{margin:4px 0 0;color:var(--muted);font-size:13px}
     .chip{
       display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--line);
       background:rgba(18,26,51,.6);border-radius:999px;box-shadow:var(--shadow);font-size:13px;color:var(--muted)
     }
     .dot{width:10px;height:10px;border-radius:999px;background:var(--warn)}
     .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:14px}
-    @media (max-width: 860px){.grid{grid-template-columns:1fr}}
+    @media (max-width:860px){.grid{grid-template-columns:1fr}}
     .card{
       background:linear-gradient(180deg, rgba(18,26,51,.9), rgba(15,23,48,.9));
       border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden
     }
-    .hd{padding:14px 14px 10px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px}
+    .hd{padding:14px 14px 10px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
     .hd h2{margin:0;font-size:15px}
     .hd small{color:var(--muted)}
     .bd{padding:14px}
     .row{display:flex;gap:10px;flex-wrap:wrap}
     .btn{
-      flex:1;min-width:140px;border:0;border-radius:14px;padding:14px 14px;font-size:16px;font-weight:800;
-      color:#0b1020;cursor:pointer;transition:transform .05s ease, filter .15s ease;
-      box-shadow:0 10px 18px rgba(0,0,0,.25)
+      flex:1;min-width:140px;border:0;border-radius:14px;padding:14px;font-size:16px;font-weight:800;
+      color:#0b1020;cursor:pointer;box-shadow:0 10px 18px rgba(0,0,0,.25)
     }
-    .btn:active{transform:translateY(1px)}
     .btnOpen{background:linear-gradient(135deg,#35d07f,#6ff3b0)}
     .btnClose{background:linear-gradient(135deg,#ff4d5d,#ff9aa3)}
-    .btnGhost{background:transparent;border:1px solid var(--line);color:var(--text);box-shadow:none;font-weight:700}
+    .btnGhost{background:transparent;border:1px solid var(--line);color:var(--text);box-shadow:none}
     .pill{
       display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;border:1px solid var(--line);
-      color:var(--muted);background:rgba(255,255,255,.04);font-size:12px;user-select:none
+      color:var(--muted);background:rgba(255,255,255,.04);font-size:12px
     }
     .statusBox{
       display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--line);
@@ -132,18 +136,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
     .switch{
       width:50px;height:28px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid var(--line);
-      position:relative;cursor:pointer;flex:0 0 auto
+      position:relative;cursor:pointer
     }
-    .knob{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:999px;background:#e8ecff;
-      transition:left .15s ease, background .15s ease}
+    .knob{position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:999px;background:#e8ecff;transition:left .15s ease}
     .switch.on{background:rgba(53,208,127,.18)}
     .switch.on .knob{left:25px;background:#6ff3b0}
     label{font-size:13px;color:var(--muted)}
     .form{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-    @media (max-width: 480px){.form{grid-template-columns:1fr}}
+    @media (max-width:480px){.form{grid-template-columns:1fr}}
     .field{display:flex;flex-direction:column;gap:6px}
     input[type="time"]{
-      width:100%;padding:12px 12px;border-radius:14px;border:1px solid var(--line);
+      width:100%;padding:12px;border-radius:14px;border:1px solid var(--line);
       background:rgba(0,0,0,.2);color:var(--text);font-size:15px;outline:none
     }
     .list{display:flex;flex-direction:column;gap:10px}
@@ -281,7 +284,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     return await r.text();
   }
 
-  // Schedule UI
   let schedules=[];
   function renderSchedules(){
     el("schedCount").textContent = schedules.length + (schedules.length===1 ? " rozvrh" : " rozvrhů");
@@ -309,29 +311,29 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   }
 
   async function loadSchedules(){
-    const txt = await apiText("/schedule/list"); // JSON
+    const txt = await apiText("/schedule/list");
     schedules = JSON.parse(txt);
     renderSchedules();
   }
 
-  // Buttons
   el("btnOpen").addEventListener("click", async ()=>{
     try{ await apiText("/open"); setConn(true,"Připojeno"); toast("OPEN"); await refreshStatus(); }
     catch(e){ setConn(false,"Chyba"); toast("Nepovedlo se /open"); }
   });
+
   el("btnClose").addEventListener("click", async ()=>{
     try{ await apiText("/close"); setConn(true,"Připojeno"); toast("CLOSE"); await refreshStatus(); }
     catch(e){ setConn(false,"Chyba"); toast("Nepovedlo se /close"); }
   });
+
   el("btnRefresh").addEventListener("click", async ()=>{
     await refreshStatus();
   });
 
   async function refreshStatus(){
     try{
-      const txt = await apiText("/status"); // text lines
+      const txt = await apiText("/status");
       setConn(true,"Připojeno");
-      // očekávej "STATE=OPEN\nMODE=AUTO\nTIME=HH:MM"
       const lines = txt.split("\n").map(x=>x.trim()).filter(Boolean);
       let st="UNKNOWN", md="MANUAL", tm="--:--";
       lines.forEach(l=>{
@@ -401,7 +403,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
   });
 
-  // init
   setConn(false,"Neověřeno");
   setState("UNKNOWN");
   setMode(false);
@@ -416,26 +417,61 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// =========================
-//  POMOCNÉ FUNKCE
-// =========================
-static inline uint16_t clampU16(int v, int lo, int hi){
-  if(v<lo) return lo;
-  if(v>hi) return hi;
-  return (uint16_t)v;
+bool isOpenLimitPressed() {
+  if (digitalRead(OPEN_LIMIT_PIN) == HIGH) {
+    delay(10);
+    return digitalRead(OPEN_LIMIT_PIN) == HIGH;
+  }
+  return false;
 }
 
-bool parseTimeHHMM(const String& s, uint16_t &outMin){
-  // očekává "08:00"
-  if(s.length() != 5 || s.charAt(2) != ':') return false;
-  int hh = s.substring(0,2).toInt();
-  int mm = s.substring(3,5).toInt();
-  if(hh<0 || hh>23 || mm<0 || mm>59) return false;
-  outMin = (uint16_t)(hh*60 + mm);
+bool isCloseLimitPressed() {
+  if (digitalRead(CLOSE_LIMIT_PIN) == HIGH) {
+    delay(10);
+    return digitalRead(CLOSE_LIMIT_PIN) == HIGH;
+  }
+  return false;
+}
+
+String stateToString() {
+  switch (doorState) {
+    case OPEN: return "OPEN";
+    case CLOSED: return "CLOSED";
+    case OPENING: return "OPENING";
+    case CLOSING: return "CLOSING";
+    case STOPPED: return "STOPPED";
+    case HOMING: return "HOMING";
+    case ERROR_STATE: return "ERROR";
+    default: return "UNKNOWN";
+  }
+}
+
+String modeToString() {
+  return autoMode ? "AUTO" : "MANUAL";
+}
+
+String nowHHMM() {
+  DateTime now = rtc.now();
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", now.hour(), now.minute());
+  return String(buf);
+}
+
+uint16_t nowMinutesOfDay() {
+  DateTime now = rtc.now();
+  return (uint16_t)(now.hour() * 60 + now.minute());
+}
+
+bool parseTimeHHMM(const String& s, uint16_t &outMin) {
+  if (s.length() != 5 || s.charAt(2) != ':') return false;
+  int hh = s.substring(0, 2).toInt();
+  int mm = s.substring(3, 5).toInt();
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
+  outMin = hh * 60 + mm;
   return true;
 }
 
-String minToHHMM(uint16_t m){
+String minToHHMM(uint16_t m) {
   uint16_t hh = m / 60;
   uint16_t mm = m % 60;
   char buf[6];
@@ -443,90 +479,92 @@ String minToHHMM(uint16_t m){
   return String(buf);
 }
 
-uint32_t nowSecondsOfDay(){
-  if(!timeSet) return 0;
-  uint32_t elapsed = (millis() - baseMillis) / 1000UL;
-  return (baseSecondsOfDay + elapsed) % 86400UL;
+int currentStepDelay() {
+  if (currentCommand == CMD_OPEN) return STEP_DELAY_US_UP;
+  return STEP_DELAY_US_DOWN;
 }
 
-uint16_t nowMinutesOfDay(){
-  return (uint16_t)(nowSecondsOfDay() / 60UL);
+void setDirection(bool dir) {
+  if (motorDirection != dir) {
+    motorDirection = dir;
+    digitalWrite(DIR_PIN, dir);
+    directionChangedAt = millis();
+    directionJustChanged = true;
+  }
 }
 
-String nowHHMM(){
-  if(!timeSet) return "--:--";
-  uint32_t s = nowSecondsOfDay();
-  uint32_t hh = s / 3600UL;
-  uint32_t mm = (s % 3600UL) / 60UL;
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)hh, (unsigned long)mm);
-  return String(buf);
+void doOneStep() {
+  int stepDelay = currentStepDelay();
+  digitalWrite(PUL_PIN, HIGH);
+  delayMicroseconds(stepDelay);
+  digitalWrite(PUL_PIN, LOW);
+  delayMicroseconds(stepDelay);
 }
 
-// Servo akce
-void doOpen(){
+void stopMotion() {
+  Serial.print("STOP | OPEN=");
+  Serial.print(isOpenLimitPressed());
+  Serial.print(" | CLOSE=");
+  Serial.println(isCloseLimitPressed());
+
+  currentCommand = CMD_NONE;
+
+  if (isOpenLimitPressed()) doorState = OPEN;
+  else if (isCloseLimitPressed()) doorState = CLOSED;
+  else doorState = STOPPED;
+}
+
+void requestOpen() {
+  currentCommand = CMD_OPEN;
+  setDirection(OPEN_DIR);
   doorState = OPENING;
-  servo1.write(ANGLE_OPEN);
-  if(USE_SERVO2) servo2.write(ANGLE_OPEN);
-  // v jednoduché verzi hned přepneme stav (bez koncáků)
-  doorState = OPEN;
+  motionStartedAt = millis();
 }
 
-void doClose(){
+void requestClose() {
+  currentCommand = CMD_CLOSE;
+  setDirection(CLOSE_DIR);
   doorState = CLOSING;
-  servo1.write(ANGLE_CLOSE);
-  if(USE_SERVO2) servo2.write(ANGLE_CLOSE);
-  doorState = CLOSED;
+  motionStartedAt = millis();
 }
 
-String stateToString(){
-  switch(doorState){
-    case OPEN: return "OPEN";
-    case CLOSED: return "CLOSED";
-    case OPENING: return "OPENING";
-    case CLOSING: return "CLOSING";
-    case STOPPED: return "STOPPED";
-    default: return "UNKNOWN";
+void requestHome() {
+  currentCommand = CMD_HOME;
+  setDirection(CLOSE_DIR);
+  doorState = HOMING;
+  motionStartedAt = millis();
+}
+
+void initSchedules() {
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    schedules[i].used = false;
+    schedules[i].id = 0;
+    schedules[i].openMin = 0;
+    schedules[i].closeMin = 0;
   }
 }
 
-String modeToString(){
-  return autoMode ? "AUTO" : "MANUAL";
-}
-
-// =========================
-//  SCHEDULE API
-// =========================
-void initSchedules(){
-  for(int i=0;i<MAX_SCHEDULES;i++){
-    schedules[i].used=false;
-    schedules[i].id=0;
-    schedules[i].openMin=0;
-    schedules[i].closeMin=0;
-    lastActionMinuteOpen[i] = -1;
-    lastActionMinuteClose[i] = -1;
-  }
-}
-
-int findFreeScheduleSlot(){
-  for(int i=0;i<MAX_SCHEDULES;i++) if(!schedules[i].used) return i;
-  return -1;
-}
-
-int findScheduleById(uint32_t id){
-  for(int i=0;i<MAX_SCHEDULES;i++){
-    if(schedules[i].used && schedules[i].id==id) return i;
+int findFreeScheduleSlot() {
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    if (!schedules[i].used) return i;
   }
   return -1;
 }
 
-String schedulesToJson(){
+int findScheduleById(uint32_t id) {
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    if (schedules[i].used && schedules[i].id == id) return i;
+  }
+  return -1;
+}
+
+String schedulesToJson() {
   String json = "[";
-  bool first=true;
-  for(int i=0;i<MAX_SCHEDULES;i++){
-    if(!schedules[i].used) continue;
-    if(!first) json += ",";
-    first=false;
+  bool first = true;
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    if (!schedules[i].used) continue;
+    if (!first) json += ",";
+    first = false;
     json += "{";
     json += "\"id\":\"" + String(schedules[i].id) + "\",";
     json += "\"open\":\"" + minToHHMM(schedules[i].openMin) + "\",";
@@ -537,67 +575,96 @@ String schedulesToJson(){
   return json;
 }
 
-// v AUTO režimu: kontrola každou smyčku
-void scheduleTick(){
-  if(!autoMode) return;
-  if(!timeSet) return;
-  uint16_t nowMin = nowMinutesOfDay();
+void scheduleTick() {
+  if (!autoMode) return;
+  if (!homed) return;
 
-  for(int i=0;i<MAX_SCHEDULES;i++){
-    if(!schedules[i].used) continue;
+  DateTime now = rtc.now();
+  uint16_t nowMin = now.hour() * 60 + now.minute();
+  int todayKey = now.year() * 10000 + now.month() * 100 + now.day();
 
-    // otevřít
-    if(nowMin == schedules[i].openMin && lastActionMinuteOpen[i] != (int)nowMin){
-      doOpen();
-      lastActionMinuteOpen[i] = nowMin;
+  static int lastOpenDay[MAX_SCHEDULES] = {0};
+  static int lastCloseDay[MAX_SCHEDULES] = {0};
+
+  for (int i = 0; i < MAX_SCHEDULES; i++) {
+    if (!schedules[i].used) continue;
+
+    if (nowMin == schedules[i].openMin && lastOpenDay[i] != todayKey) {
+      requestOpen();
+      lastOpenDay[i] = todayKey;
     }
 
-    // zavřít
-    if(nowMin == schedules[i].closeMin && lastActionMinuteClose[i] != (int)nowMin){
-      doClose();
-      lastActionMinuteClose[i] = nowMin;
+    if (nowMin == schedules[i].closeMin && lastCloseDay[i] != todayKey) {
+      requestClose();
+      lastCloseDay[i] = todayKey;
     }
-
-    // reset ochrany po změně minuty (aby to fungovalo další den)
-    // (tady stačí jednoduché – při rozdílné minutě už se to spustí znovu až když se to rovná)
   }
 }
 
-// =========================
-//  HTTP HELPERS (synchronní)
-// =========================
-String getQueryParam(const String& reqLine, const String& key){
-  // reqLine = "GET /path?x=1&y=2 HTTP/1.1"
+void processMotion() {
+  if (currentCommand == CMD_NONE) return;
+
+  if (millis() - motionStartedAt > MOVE_TIMEOUT_MS) {
+    Serial.println("TIMEOUT POHYBU");
+    currentCommand = CMD_NONE;
+    doorState = ERROR_STATE;
+    return;
+  }
+
+  if (directionJustChanged) {
+    if (millis() - directionChangedAt < DIR_CHANGE_DELAY_MS) return;
+    directionJustChanged = false;
+  }
+
+  if ((currentCommand == CMD_OPEN) && isOpenLimitPressed()) {
+    doorState = OPEN;
+    stopMotion();
+    return;
+  }
+
+  if ((currentCommand == CMD_CLOSE || currentCommand == CMD_HOME) && isCloseLimitPressed()) {
+    if (currentCommand == CMD_HOME) homed = true;
+    doorState = CLOSED;
+    stopMotion();
+    return;
+  }
+
+  unsigned long nowMicros = micros();
+  if (nowMicros - lastStepMicros >= (unsigned long)(currentStepDelay() * 2)) {
+    lastStepMicros = nowMicros;
+    doOneStep();
+  }
+}
+
+String getQueryParam(const String& reqLine, const String& key) {
   int q = reqLine.indexOf('?');
-  if(q < 0) return "";
+  if (q < 0) return "";
   int sp = reqLine.indexOf(' ', q);
-  String qs = reqLine.substring(q+1, sp); // "x=1&y=2"
+  String qs = reqLine.substring(q + 1, sp);
   String find = key + "=";
   int p = qs.indexOf(find);
-  if(p < 0) return "";
+  if (p < 0) return "";
   int start = p + find.length();
   int amp = qs.indexOf('&', start);
-  if(amp < 0) amp = qs.length();
+  if (amp < 0) amp = qs.length();
   String val = qs.substring(start, amp);
-  val.replace("%3A", ":"); // minimální decode pro HH:MM
-  val.replace("%2F", "/");
+  val.replace("%3A", ":");
   val.replace("%20", " ");
   return val;
 }
 
-String getPath(const String& reqLine){
-  // "GET /open HTTP/1.1" -> "/open"
+String getPath(const String& reqLine) {
   int s1 = reqLine.indexOf(' ');
-  if(s1 < 0) return "/";
-  int s2 = reqLine.indexOf(' ', s1+1);
-  if(s2 < 0) return "/";
-  String full = reqLine.substring(s1+1, s2);
+  if (s1 < 0) return "/";
+  int s2 = reqLine.indexOf(' ', s1 + 1);
+  if (s2 < 0) return "/";
+  String full = reqLine.substring(s1 + 1, s2);
   int q = full.indexOf('?');
-  if(q >= 0) return full.substring(0, q);
+  if (q >= 0) return full.substring(0, q);
   return full;
 }
 
-void sendText(WiFiClient &client, const String& body, const String& type="text/plain; charset=utf-8"){
+void sendText(WiFiClient &client, const String& body, const String& type = "text/plain; charset=utf-8") {
   client.println("HTTP/1.1 200 OK");
   client.println("Content-type:" + type);
   client.println("Connection: close");
@@ -605,7 +672,7 @@ void sendText(WiFiClient &client, const String& body, const String& type="text/p
   client.print(body);
 }
 
-void sendHtml(WiFiClient &client){
+void sendHtml(WiFiClient &client) {
   client.println("HTTP/1.1 200 OK");
   client.println("Content-type:text/html; charset=utf-8");
   client.println("Connection: close");
@@ -613,7 +680,7 @@ void sendHtml(WiFiClient &client){
   client.print(INDEX_HTML);
 }
 
-void sendNotFound(WiFiClient &client){
+void sendNotFound(WiFiClient &client) {
   client.println("HTTP/1.1 404 Not Found");
   client.println("Content-type:text/plain; charset=utf-8");
   client.println("Connection: close");
@@ -621,36 +688,40 @@ void sendNotFound(WiFiClient &client){
   client.print("404");
 }
 
-// iPhone captive portal endpointy – ať se chytne stránka
-bool handleCaptivePortal(const String& path, WiFiClient &client){
-  if(path == "/generate_204" || path == "/hotspot-detect.html" || path == "/fwlink" || path == "/") {
+bool handleCaptivePortal(const String& path, WiFiClient &client) {
+  if (path == "/generate_204" || path == "/hotspot-detect.html" || path == "/fwlink" || path == "/") {
     sendHtml(client);
     return true;
   }
   return false;
 }
 
-// =========================
-//  SETUP / LOOP
-// =========================
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  initSchedules();
+  pinMode(PUL_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
 
-  // Servo init
-  servo1.setPeriodHertz(50);
-  servo1.attach(SERVO1_PIN, 500, 2400);
-  if(USE_SERVO2){
-    servo2.setPeriodHertz(50);
-    servo2.attach(SERVO2_PIN, 500, 2400);
+  pinMode(OPEN_LIMIT_PIN, INPUT_PULLUP);
+  pinMode(CLOSE_LIMIT_PIN, INPUT_PULLUP);
+
+  digitalWrite(PUL_PIN, LOW);
+  digitalWrite(DIR_PIN, OPEN_DIR);
+
+  Wire.begin(23, 22);
+
+  if (!rtc.begin()) {
+    Serial.println("RTC nenalezeno");
+  } else {
+    Serial.println("RTC OK");
   }
 
-  // Default state
-  doClose();
+  initSchedules();
 
-  // Wi-Fi AP start
+  doorState = UNKNOWN;
+  homed = false;
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -662,105 +733,101 @@ void setup() {
   Serial.println(IP);
 
   server.begin();
+
+  requestHome();
 }
 
 void loop() {
+  processMotion();
   scheduleTick();
 
   WiFiClient client = server.available();
   if (!client) return;
 
-  Serial.println("New Client connected");
-
-  // přečteme jen první řádek requestu
   String reqLine = client.readStringUntil('\n');
-  reqLine.trim(); // remove \r
-  // "GET /path HTTP/1.1"
-  // pro jistotu dočteme zbytek hlaviček, ale rychle:
+  reqLine.trim();
+
   while (client.connected() && client.available()) {
     String line = client.readStringUntil('\n');
-    if(line == "\r" || line.length() == 1) break;
+    if (line == "\r" || line.length() == 1) break;
   }
 
   String path = getPath(reqLine);
 
-  // captive portal support
-  if(handleCaptivePortal(path, client)){
+  if (handleCaptivePortal(path, client)) {
     client.stop();
     return;
   }
 
-  // ROUTES
-  if(path == "/open"){
-    doOpen();
+  if (path == "/open") {
+    requestOpen();
     sendText(client, "OK");
   }
-  else if(path == "/close"){
-    doClose();
+  else if (path == "/close") {
+    requestClose();
     sendText(client, "OK");
   }
-  else if(path == "/mode"){
+  else if (path == "/mode") {
     String a = getQueryParam(reqLine, "auto");
     autoMode = (a == "1");
     sendText(client, "OK");
   }
-  else if(path == "/status"){
+  else if (path == "/status") {
     String body;
     body += "STATE=" + stateToString() + "\n";
     body += "MODE=" + modeToString() + "\n";
     body += "TIME=" + nowHHMM() + "\n";
     sendText(client, body);
   }
-  else if(path == "/time/set"){
+  else if (path == "/time/set") {
     String hhS = getQueryParam(reqLine, "hh");
     String mmS = getQueryParam(reqLine, "mm");
+
     int hh = hhS.toInt();
     int mm = mmS.toInt();
-    hh = (int)clampU16(hh, 0, 23);
-    mm = (int)clampU16(mm, 0, 59);
-    baseSecondsOfDay = (uint32_t)(hh*3600 + mm*60);
-    baseMillis = millis();
-    timeSet = true;
-    sendText(client, "OK");
+
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      DateTime now = rtc.now();
+      rtc.adjust(DateTime(now.year(), now.month(), now.day(), hh, mm, 0));
+      sendText(client, "OK");
+    } else {
+      sendText(client, "BAD_TIME");
+    }
   }
-  else if(path == "/schedule/add"){
-    String openS  = getQueryParam(reqLine, "open");  // "08:00"
-    String closeS = getQueryParam(reqLine, "close"); // "20:00"
+  else if (path == "/schedule/add") {
+    String openS  = getQueryParam(reqLine, "open");
+    String closeS = getQueryParam(reqLine, "close");
     uint16_t oMin, cMin;
-    if(!parseTimeHHMM(openS, oMin) || !parseTimeHHMM(closeS, cMin)){
-      sendText(client, "BAD_TIME", "text/plain; charset=utf-8");
-    }else{
+
+    if (!parseTimeHHMM(openS, oMin) || !parseTimeHHMM(closeS, cMin)) {
+      sendText(client, "BAD_TIME");
+    } else {
       int idx = findFreeScheduleSlot();
-      if(idx < 0){
-        sendText(client, "FULL", "text/plain; charset=utf-8");
-      }else{
+      if (idx < 0) {
+        sendText(client, "FULL");
+      } else {
         schedules[idx].used = true;
         schedules[idx].openMin = oMin;
         schedules[idx].closeMin = cMin;
-        schedules[idx].id = (uint32_t)esp_random(); // id pro mazání
-        lastActionMinuteOpen[idx] = -1;
-        lastActionMinuteClose[idx] = -1;
+        schedules[idx].id = (uint32_t)esp_random();
         sendText(client, "OK");
       }
     }
   }
-  else if(path == "/schedule/list"){
-    String json = schedulesToJson();
-    sendText(client, json, "application/json; charset=utf-8");
+  else if (path == "/schedule/list") {
+    sendText(client, schedulesToJson(), "application/json; charset=utf-8");
   }
-  else if(path == "/schedule/del"){
+  else if (path == "/schedule/del") {
     String idS = getQueryParam(reqLine, "id");
     uint32_t id = (uint32_t)idS.toInt();
     int idx = findScheduleById(id);
-    if(idx >= 0){
+
+    if (idx >= 0) {
       schedules[idx].used = false;
       sendText(client, "OK");
-    }else{
+    } else {
       sendText(client, "NOT_FOUND");
     }
-  }
-  else if(path == "/"){
-    sendHtml(client);
   }
   else {
     sendNotFound(client);
