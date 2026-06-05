@@ -7,7 +7,7 @@ Jednoduché manuální i automatické řízení s možností nastavení časové
 Otevři připojení k WiFi -> najdi síť "ESP32-kurnik" -> zadej heslo: 123456789 -> otevři webový prohlížeč -> do vyhledávacího pole zadej 192.168.4.1
 
 **Jak se systém ovládá?**
-Jednoduše, tlačítka otevřít a zavřit, nový rozvrh nastavíš tím, že vybereš čas otevření a zavření a rozvrh uložíš.
+Jednoduše, tlačítka otevřít a zavřit pro manuální ovlándání. Nový rozvrh nastavíš tím, že vybereš čas otevření a zavření a rozvrh uložíš.
 
 ---
 
