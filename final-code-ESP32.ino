@@ -19,7 +19,7 @@ int STEP_DELAY_US_DOWN = 1150;
 
 const int DIR_CHANGE_DELAY_MS = 50;
 
-const unsigned long MOVE_TIMEOUT_MS = 25000;
+const unsigned long MOVE_TIMEOUT_MS = 210000;
 
 
 RTC_DS3231 rtc;
